@@ -1,84 +1,92 @@
-from fastapi import FastAPI, Header, HTTPException, Query
+# main.py
+from fastapi import FastAPI, HTTPException, Header, Query, Depends
 from pydantic import BaseModel
-import json
-import os
+from typing import Optional, List
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
-app = FastAPI()
-DATA_FILE = "todos.json"
-
-# -----------------------------
-# API Key (simple token-based security)
-# -----------------------------
+# ------------- Config -------------
 API_KEY = "Jan"
+DATABASE_URL = "sqlite:///./app.db"  # local sqlite file
+
+# ------------- DB setup -------------
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+class TodoDB(Base):
+    __tablename__ = "todos"
+    id = Column(Integer, primary_key=True, index=True)
+    task = Column(String, nullable=False)
+    status = Column(String, default="pending")
+
+Base.metadata.create_all(bind=engine)
+
+# ------------- FastAPI / Models -------------
+app = FastAPI(title="Janani's To-Do API (SQLite + Docker)")
+
+class TodoCreate(BaseModel):
+    task: str
+    status: Optional[str] = "pending"
+
+class TodoOut(BaseModel):
+    id: int
+    task: str
+    status: str
+
+# ------------- Utils -------------
+def get_db():
+    db: Session = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 def verify_token(x_api_key: str = Header(...)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-# -----------------------------
-# Todo Model
-# -----------------------------
-class TodoItem(BaseModel):
-    task: str
-    status: str = "pending"  # default status
-
-# -----------------------------
-# Load todos from file if exists
-# -----------------------------
-if os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "r") as f:
-        todos = json.load(f)
-else:
-    todos = []
-
-# -----------------------------
-# Save todos to file
-# -----------------------------
-def save_todos():
-    with open(DATA_FILE, "w") as f:
-        json.dump(todos, f)
-
-# -----------------------------
-# Routes
-# -----------------------------
+# ------------- Routes -------------
 @app.get("/")
 def home():
-    return {"message": "Welcome to Janani's Enhanced To-Do API!"}
+    return {"message": "Welcome to Janani's To-Do API (SQLite)!"}
 
-@app.get("/todos")
-def get_todos(status: str = Query(None, description="Filter by task status"), x_api_key: str = Header()):
+@app.get("/todos", response_model=List[TodoOut])
+def list_todos(status: Optional[str] = Query(None), x_api_key: str = Header(...), db: Session = Depends(get_db)):
     verify_token(x_api_key)
     if status:
-        filtered = [task for task in todos if task["status"] == status]
-        return {"todos": filtered}
-    return {"todos": todos}
+        items = db.query(TodoDB).filter(TodoDB.status == status).all()
+    else:
+        items = db.query(TodoDB).all()
+    return items
 
-@app.post("/todos")
-def add_todo(item: TodoItem, x_api_key: str = Header(...)):
+@app.post("/todos", response_model=TodoOut)
+def create_todo(item: TodoCreate, x_api_key: str = Header(...), db: Session = Depends(get_db)):
     verify_token(x_api_key)
-    task_id = todos[-1]["id"] + 1 if todos else 0
-    task = {"id": task_id, "task": item.task, "status": item.status}
-    todos.append(task)
-    save_todos()
-    return {"message": "Task added successfully", "todos": todos}
+    todo = TodoDB(task=item.task, status=item.status)
+    db.add(todo)
+    db.commit()
+    db.refresh(todo)
+    return todo
 
-@app.put("/todos/{task_id}")
-def update_todo(task_id: int, item: TodoItem, x_api_key: str = Header(...)):
+@app.put("/todos/{todo_id}", response_model=TodoOut)
+def update_todo(todo_id: int, item: TodoCreate, x_api_key: str = Header(...), db: Session = Depends(get_db)):
     verify_token(x_api_key)
-    for task in todos:
-        if task["id"] == task_id:
-            task["task"] = item.task
-            task["status"] = item.status
-            save_todos()
-            return {"message": "Task updated successfully", "todos": todos}
-    return {"error": "Invalid task ID"}
+    todo = db.query(TodoDB).filter(TodoDB.id == todo_id).first()
+    if not todo:
+        raise HTTPException(status_code=404, detail="Task not found")
+    todo.task = item.task
+    todo.status = item.status
+    db.commit()
+    db.refresh(todo)
+    return todo
 
-@app.delete("/todos/{task_id}")
-def delete_todo(task_id: int, x_api_key: str = Header(...)):
+@app.delete("/todos/{todo_id}")
+def delete_todo(todo_id: int, x_api_key: str = Header(...), db: Session = Depends(get_db)):
     verify_token(x_api_key)
-    for i, task in enumerate(todos):
-        if task["id"] == task_id:
-            deleted = todos.pop(i)
-            save_todos()
-            return {"message": f"Deleted: {deleted}", "todos": todos}
-    return {"error": "Invalid task ID"}
+    todo = db.query(TodoDB).filter(TodoDB.id == todo_id).first()
+    if not todo:
+        raise HTTPException(status_code=404, detail="Task not found")
+    db.delete(todo)
+    db.commit()
+    return {"message": "Deleted", "id": todo_id}
